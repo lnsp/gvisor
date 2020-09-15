@@ -29,7 +29,7 @@
 //
 // Reference Model:
 //
-// Kernfs dentries represents named pointers to inodes. Dentries and inode have
+// Kernfs dentries represents named pointers to inodes. Dentries and inodes have
 // independent lifetimes and reference counts. A child dentry unconditionally
 // holds a reference on its parent directory's dentry. A dentry also holds a
 // reference on the inode it points to. Multiple dentries can point to the same
@@ -240,9 +240,8 @@ func (d *Dentry) Watches() *vfs.Watches {
 func (d *Dentry) OnZeroWatches(context.Context) {}
 
 // InsertChild inserts child into the vfs dentry cache with the given name under
-// this dentry. This does not update the directory inode, so calling this on
-// its own isn't sufficient to insert a child into a directory. InsertChild
-// updates the link count on d if required.
+// this dentry. This does not update the directory inode, so calling this on its
+// own isn't sufficient to insert a child into a directory.
 //
 // Precondition: d must represent a directory inode.
 func (d *Dentry) InsertChild(name string, child *Dentry) {
@@ -254,10 +253,12 @@ func (d *Dentry) InsertChild(name string, child *Dentry) {
 // InsertChildLocked is equivalent to InsertChild, with additional
 // preconditions.
 //
-// Precondition: d.dirMu must be locked.
+// Preconditions:
+// * d must represent a directory inode.
+// * d.dirMu must be locked.
 func (d *Dentry) InsertChildLocked(name string, child *Dentry) {
 	if !d.isDir() {
-		panic(fmt.Sprintf("InsertChild called on non-directory Dentry: %+v.", d))
+		panic(fmt.Sprintf("insertChildLocked called on non-directory Dentry: %+v.", d))
 	}
 	d.IncRef() // DecRef in child's Dentry.destroy.
 	child.parent = d
@@ -318,7 +319,6 @@ func (d *Dentry) Inode() Inode {
 //
 // - Checking that dentries passed to methods are of the appropriate file type.
 // - Checking permissions.
-// - Updating link and reference counts.
 //
 // Specific responsibilities of implementations are documented below.
 type Inode interface {
@@ -328,7 +328,8 @@ type Inode interface {
 	inodeRefs
 
 	// Methods related to node metadata. A generic implementation is provided by
-	// InodeAttrs.
+	// InodeAttrs. Note that a concrete filesystem using kernfs is responsible for
+	// managing link counts.
 	inodeMetadata
 
 	// Method for inodes that represent symlink. InodeNotSymlink provides a
@@ -449,7 +450,7 @@ type inodeDynamicLookup interface {
 	//
 	// Lookup returns the child with an extra reference and the caller owns this
 	// reference.
-	Lookup(ctx context.Context, name string) (*vfs.Dentry, error)
+	Lookup(ctx context.Context, name string) (*Dentry, error)
 
 	// Valid should return true if this inode is still valid, or needs to
 	// be resolved again by a call to Lookup.
