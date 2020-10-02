@@ -501,7 +501,9 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 
 	// Grab our thread from the pool.
 	currentTID := int32(procid.Current())
+	fmt.Println("switch to app", currentTID)
 	t := s.sysemuThreads.lookupOrCreate(currentTID, s.newThread)
+	defer t.destroy()
 
 	// Reset necessary registers.
 	regs := &ac.StateData().Regs
