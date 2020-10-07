@@ -67,6 +67,8 @@ type thread struct {
 	initRegs arch.Registers
 }
 
+var threadCount int64
+
 // threadPool is a collection of threads.
 type threadPool struct {
 	// mu protects below.
@@ -97,9 +99,11 @@ func (tp *threadPool) lookupOrCreate(currentTID int32, newThread func() *thread)
 		for origTID, t := range tp.threads {
 			// Signal zero is an easy existence check.
 			if err := syscall.Tgkill(syscall.Getpid(), int(origTID), 0); err != nil {
+				fmt.Println("reuse thread")
 				// This thread has been abandoned; reuse it.
 				delete(tp.threads, origTID)
 				tp.threads[currentTID] = t
+				//fmt.Println("thread count", atomic.AddInt64(&threadCount, -1))
 				tp.mu.Unlock()
 				return t
 			}
@@ -108,6 +112,7 @@ func (tp *threadPool) lookupOrCreate(currentTID int32, newThread func() *thread)
 		// Create a new thread.
 		t = newThread()
 		tp.threads[currentTID] = t
+		//fmt.Println("thread count", atomic.AddInt64(&threadCount, 1))
 	}
 	tp.mu.Unlock()
 	return t
@@ -259,6 +264,7 @@ func (s *subprocess) newThread() *thread {
 	r := make(chan *thread)
 	s.requests <- r
 	t := <-r
+	close(r)
 
 	// Attach the subprocess to this one.
 	t.attach()
@@ -417,6 +423,7 @@ func (t *thread) init() {
 	if errno != 0 {
 		panic(fmt.Sprintf("ptrace set options failed: %v", errno))
 	}
+	fmt.Println("initialized thread")
 }
 
 // syscall executes a system call cycle in the traced context.
@@ -501,9 +508,8 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 
 	// Grab our thread from the pool.
 	currentTID := int32(procid.Current())
-	fmt.Println("switch to app", currentTID)
 	t := s.sysemuThreads.lookupOrCreate(currentTID, s.newThread)
-	defer t.destroy()
+	//fmt.Println("switch to app", currentTID, t.tid)
 
 	// Reset necessary registers.
 	regs := &ac.StateData().Regs
@@ -551,6 +557,11 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 
 		// Wait for the syscall-enter stop.
 		sig := t.wait(stopped)
+
+		fmt.Println(int(sig))
+		if sig>>8 == (syscall.SIGTRAP | (syscall.PTRACE_EVENT_CLONE << 8)) {
+			fmt.Println("dieing")
+		}
 
 		// Refresh all registers.
 		if err := t.getRegs(regs); err != nil {
