@@ -112,7 +112,6 @@ func (tp *threadPool) lookupOrCreate(currentTID int32, newThread func() *thread)
 		// Create a new thread.
 		t = newThread()
 		tp.threads[currentTID] = t
-		//fmt.Println("thread count", atomic.AddInt64(&threadCount, 1))
 	}
 	tp.mu.Unlock()
 	return t
@@ -127,10 +126,12 @@ type subprocess struct {
 
 	// sysemuThreads are reserved for emulation.
 	sysemuThreads threadPool
+	sysemuRPCChan chan sysemuRPC
 
 	// syscallThreads are reserved for syscalls (except clone, which is
 	// handled in the dedicated goroutine corresponding to requests above).
 	syscallThreads threadPool
+	syscallRPCChan chan syscallRPC
 
 	// mu protects the following fields.
 	mu sync.Mutex
@@ -221,8 +222,12 @@ func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
 		syscallThreads: threadPool{
 			threads: make(map[int32]*thread),
 		},
-		contexts: make(map[*context]struct{}),
+		syscallRPCChan: make(chan syscallRPC),
+		sysemuRPCChan:  make(chan sysemuRPC),
+		contexts:       make(map[*context]struct{}),
 	}
+	go sp.syscallLoop()
+	go sp.switchToAppLoop()
 
 	sp.unmap()
 	return sp, nil
@@ -423,7 +428,6 @@ func (t *thread) init() {
 	if errno != 0 {
 		panic(fmt.Sprintf("ptrace set options failed: %v", errno))
 	}
-	fmt.Println("initialized thread")
 }
 
 // syscall executes a system call cycle in the traced context.
@@ -493,23 +497,17 @@ func (t *thread) NotifyInterrupt() {
 	syscall.Tgkill(int(t.tgid), int(t.tid), syscall.Signal(platform.SignalInterrupt))
 }
 
-// switchToApp is called from the main SwitchToApp entrypoint.
-//
-// This function returns true on a system call, false on a signal.
-func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
-	// Lock the thread for ptrace operations.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+type sysemuRPC struct {
+	c   *context
+	ac  arch.Context
+	ret chan bool
+}
 
+func (s *subprocess) switchToAppLocked(t *thread, c *context, ac arch.Context) bool {
 	// Extract floating point state.
 	fpState := ac.FloatingPointData()
 	fpLen, _ := ac.FeatureSet().ExtendedStateSize()
 	useXsave := ac.FeatureSet().UseXsave()
-
-	// Grab our thread from the pool.
-	currentTID := int32(procid.Current())
-	t := s.sysemuThreads.lookupOrCreate(currentTID, s.newThread)
-	//fmt.Println("switch to app", currentTID, t.tid)
 
 	// Reset necessary registers.
 	regs := &ac.StateData().Regs
@@ -557,11 +555,6 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 
 		// Wait for the syscall-enter stop.
 		sig := t.wait(stopped)
-
-		fmt.Println(int(sig))
-		if sig>>8 == (syscall.SIGTRAP | (syscall.PTRACE_EVENT_CLONE << 8)) {
-			fmt.Println("dieing")
-		}
 
 		// Refresh all registers.
 		if err := t.getRegs(regs); err != nil {
@@ -613,15 +606,69 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 	}
 }
 
-// syscall executes the given system call without handling interruptions.
-func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintptr, error) {
-	// Grab a thread.
+func (s *subprocess) switchToAppLoop() {
+	// Lock the thread for ptrace operations.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Grab our thread from the pool.
+	currentTID := int32(procid.Current())
+	t := s.sysemuThreads.lookupOrCreate(currentTID, s.newThread)
+
+	for rpc := range s.sysemuRPCChan {
+		isSyscall := s.switchToAppLocked(t, rpc.c, rpc.ac)
+		rpc.ret <- isSyscall
+	}
+}
+
+// switchToApp is called from the main SwitchToApp entrypoint.
+//
+// This function returns true on a system call, false on a signal.
+func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
+	retch := make(chan bool)
+	s.sysemuRPCChan <- sysemuRPC{
+		c:   c,
+		ac:  ac,
+		ret: retch,
+	}
+	ret := <-retch
+	close(retch)
+	return ret
+}
+
+type syscallRPC struct {
+	sysno uintptr
+	args  []arch.SyscallArgument
+	ret   chan syscallRPCRet
+}
+
+type syscallRPCRet struct {
+	val uintptr
+	err error
+}
+
+func (s *subprocess) syscallLoop() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	currentTID := int32(procid.Current())
 	t := s.syscallThreads.lookupOrCreate(currentTID, s.newThread)
+	for rpc := range s.syscallRPCChan {
+		val, err := t.syscallIgnoreInterrupt(&t.initRegs, rpc.sysno, rpc.args...)
+		rpc.ret <- syscallRPCRet{val, err}
+	}
+}
 
-	return t.syscallIgnoreInterrupt(&t.initRegs, sysno, args...)
+// syscall executes the given system call without handling interruptions.
+func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintptr, error) {
+	retch := make(chan syscallRPCRet)
+	s.syscallRPCChan <- syscallRPC{
+		sysno: sysno,
+		args:  args,
+		ret:   retch,
+	}
+	ret := <-retch
+	close(retch)
+	return ret.val, ret.err
 }
 
 // MapFile implements platform.AddressSpace.MapFile.
