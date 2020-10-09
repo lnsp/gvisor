@@ -67,8 +67,6 @@ type thread struct {
 	initRegs arch.Registers
 }
 
-var threadCount int64
-
 // threadPool is a collection of threads.
 type threadPool struct {
 	// mu protects below.
@@ -126,7 +124,6 @@ type subprocess struct {
 
 	// sysemuThreads are reserved for emulation.
 	sysemuThreads threadPool
-	sysemuRPCChan chan sysemuRPC
 
 	// syscallThreads are reserved for syscalls (except clone, which is
 	// handled in the dedicated goroutine corresponding to requests above).
@@ -138,7 +135,8 @@ type subprocess struct {
 
 	// contexts is the set of contexts for which it's possible that
 	// context.lastFaultSP == this subprocess.
-	contexts map[*context]struct{}
+	sysemuRPCPool map[int64]chan sysemuRPC
+	contexts      map[*context]struct{}
 }
 
 // newSubprocess returns a usable subprocess.
@@ -223,11 +221,10 @@ func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
 			threads: make(map[int32]*thread),
 		},
 		syscallRPCChan: make(chan syscallRPC),
-		sysemuRPCChan:  make(chan sysemuRPC),
+		sysemuRPCPool:  make(map[int64]chan sysemuRPC),
 		contexts:       make(map[*context]struct{}),
 	}
 	go sp.syscallLoop()
-	go sp.switchToAppLoop()
 
 	sp.unmap()
 	return sp, nil
@@ -326,6 +323,8 @@ const (
 
 	// killed indicates that the process was killed.
 	killed
+
+	exited
 )
 
 func (t *thread) dumpAndPanic(message string) {
@@ -394,6 +393,23 @@ func (t *thread) wait(outcome waitOutcome) syscall.Signal {
 				t.dumpAndPanic(fmt.Sprintf("ptrace status unexpected: got %v, wanted exited", status))
 			}
 			return syscall.Signal(status.ExitStatus())
+		case exited:
+			if !status.Stopped() {
+				t.dumpAndPanic(fmt.Sprintf("ptrace status unexpected: got %v, wanted stopped", status))
+			}
+			stopSig := status.StopSignal()
+			if stopSig == 0 {
+				continue // Spurious stop.
+			}
+			if stopSig == syscall.SIGTRAP {
+				if status.TrapCause() == syscall.PTRACE_EVENT_EXIT {
+					return syscall.SIGTRAP
+				}
+				// Re-encode the trap cause the way it's expected.
+				return stopSig | syscall.Signal(status.TrapCause()<<8)
+			}
+			// Not a trap signal.
+			return stopSig
 		default:
 			// Should not happen.
 			t.dumpAndPanic(fmt.Sprintf("unknown outcome: %v", outcome))
@@ -410,6 +426,12 @@ func (t *thread) destroy() {
 	t.detach()
 	syscall.Tgkill(int(t.tgid), int(t.tid), syscall.Signal(syscall.SIGKILL))
 	t.wait(killed)
+}
+
+// exit stops the thread.
+func (t *thread) exit() {
+	t.syscallIgnoreInterruptWithOutcome(&t.initRegs, syscall.SYS_EXIT, exited, arch.SyscallArgument{Value: 0})
+	t.detach()
 }
 
 // init initializes trace options.
@@ -470,6 +492,41 @@ func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
 	return syscallReturnValue(regs)
 }
 
+func (t *thread) syscallWithOutcome(regs *arch.Registers, outcome waitOutcome) (uintptr, error) {
+	// Set registers.
+	if err := t.setRegs(regs); err != nil {
+		panic(fmt.Sprintf("ptrace set regs failed: %v", err))
+	}
+
+	for {
+		// Execute the syscall instruction. The task has to stop on the
+		// trap instruction which is right after the syscall
+		// instruction.
+		if _, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE, syscall.PTRACE_CONT, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
+			panic(fmt.Sprintf("ptrace syscall-enter failed: %v", errno))
+		}
+
+		sig := t.wait(outcome)
+		if sig == syscall.SIGTRAP {
+			// Reached syscall-enter-stop.
+			break
+		} else {
+			// Some other signal caused a thread stop; ignore.
+			if sig != syscall.SIGSTOP && sig != syscall.SIGCHLD {
+				log.Warningf("The thread %d:%d has been interrupted by %d", t.tgid, t.tid, sig)
+			}
+			continue
+		}
+	}
+
+	// Grab registers.
+	if err := t.getRegs(regs); err != nil {
+		panic(fmt.Sprintf("ptrace get regs failed: %v", err))
+	}
+
+	return syscallReturnValue(regs)
+}
+
 // syscallIgnoreInterrupt ignores interrupts on the system call thread and
 // restarts the syscall if the kernel indicates that should happen.
 func (t *thread) syscallIgnoreInterrupt(
@@ -479,6 +536,27 @@ func (t *thread) syscallIgnoreInterrupt(
 	for {
 		regs := createSyscallRegs(initRegs, sysno, args...)
 		rval, err := t.syscall(&regs)
+		switch err {
+		case ERESTARTSYS:
+			continue
+		case ERESTARTNOINTR:
+			continue
+		case ERESTARTNOHAND:
+			continue
+		default:
+			return rval, err
+		}
+	}
+}
+
+func (t *thread) syscallIgnoreInterruptWithOutcome(
+	initRegs *arch.Registers,
+	sysno uintptr,
+	outcome waitOutcome,
+	args ...arch.SyscallArgument) (uintptr, error) {
+	for {
+		regs := createSyscallRegs(initRegs, sysno, args...)
+		rval, err := t.syscallWithOutcome(&regs, outcome)
 		switch err {
 		case ERESTARTSYS:
 			continue
@@ -606,34 +684,45 @@ func (s *subprocess) switchToAppLocked(t *thread, c *context, ac arch.Context) b
 	}
 }
 
-func (s *subprocess) switchToAppLoop() {
+func (s *subprocess) switchToAppLoop(sysemuRPCChan chan sysemuRPC) {
 	// Lock the thread for ptrace operations.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	// Grab our thread from the pool.
-	currentTID := int32(procid.Current())
-	t := s.sysemuThreads.lookupOrCreate(currentTID, s.newThread)
+	t := s.newThread()
 
-	for rpc := range s.sysemuRPCChan {
+	for rpc := range sysemuRPCChan {
 		isSyscall := s.switchToAppLocked(t, rpc.c, rpc.ac)
 		rpc.ret <- isSyscall
 	}
+
+	// syscall.Kill(int(t.tid), syscall.Signal(syscall.SIGCONT))
+	t.exit()
 }
 
 // switchToApp is called from the main SwitchToApp entrypoint.
 //
 // This function returns true on a system call, false on a signal.
 func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
-	retch := make(chan bool)
-	s.sysemuRPCChan <- sysemuRPC{
+	ret := make(chan bool)
+	defer close(ret)
+	rpc := sysemuRPC{
 		c:   c,
 		ac:  ac,
-		ret: retch,
+		ret: ret,
 	}
-	ret := <-retch
-	close(retch)
-	return ret
+	s.mu.Lock()
+	ch, ok := s.sysemuRPCPool[c.cid]
+	if !ok {
+		ch = make(chan sysemuRPC)
+		s.sysemuRPCPool[c.cid] = ch
+		go s.switchToAppLoop(ch)
+		go func() { <-c.done; close(ch) }()
+	}
+	s.mu.Unlock()
+	ch <- rpc
+	return <-ret
 }
 
 type syscallRPC struct {

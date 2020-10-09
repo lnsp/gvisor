@@ -79,6 +79,8 @@ begin:
 	CMPQ BX, $1
 	JE clone
 
+	CMPQ BX, $2
+  JE quit
 	// Notify the Sentry that syscall exited.
 done:
 	INT $3
@@ -95,6 +97,12 @@ clone:
 
 	// The clone syscall returns a non-zero value.
 	JMP done
+quit:
+  MOVQ $SYS_EXIT, AX
+  MOVQ $0, DI
+  SYSCALL
+  HLT
+
 error:
 	// Exit with -errno.
 	MOVQ AX, DI

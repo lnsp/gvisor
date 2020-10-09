@@ -72,6 +72,9 @@ var (
 )
 
 type context struct {
+	cid  int64
+	done chan struct{}
+
 	// signalInfo is the signal info, if and when a signal is received.
 	signalInfo arch.SignalInfo
 
@@ -180,7 +183,10 @@ func (c *context) Interrupt() {
 }
 
 // Release implements platform.Context.Release().
-func (c *context) Release() {}
+func (c *context) Release() {
+	// Close done channel
+	close(c.done)
+}
 
 // FullStateChanged implements platform.Context.FullStateChanged.
 func (c *context) FullStateChanged() {}
@@ -192,6 +198,9 @@ func (c *context) PullFullState(as platform.AddressSpace, ac arch.Context) {}
 type PTrace struct {
 	platform.MMapMinAddr
 	platform.NoCPUPreemptionDetection
+
+	mu      sync.Mutex
+	lastCID int64
 }
 
 // New returns a new ptrace-based implementation of the platform interface.
@@ -245,8 +254,12 @@ func (p *PTrace) NewAddressSpace(_ interface{}) (platform.AddressSpace, <-chan s
 }
 
 // NewContext returns an interruptible context.
-func (*PTrace) NewContext() platform.Context {
-	return &context{}
+func (p *PTrace) NewContext() platform.Context {
+	p.mu.Lock()
+	p.lastCID++
+	cid := p.lastCID
+	p.mu.Unlock()
+	return &context{cid: cid, done: make(chan struct{})}
 }
 
 type constructor struct{}
