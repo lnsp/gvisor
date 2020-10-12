@@ -97,11 +97,9 @@ func (tp *threadPool) lookupOrCreate(currentTID int32, newThread func() *thread)
 		for origTID, t := range tp.threads {
 			// Signal zero is an easy existence check.
 			if err := syscall.Tgkill(syscall.Getpid(), int(origTID), 0); err != nil {
-				fmt.Println("reuse thread")
 				// This thread has been abandoned; reuse it.
 				delete(tp.threads, origTID)
 				tp.threads[currentTID] = t
-				//fmt.Println("thread count", atomic.AddInt64(&threadCount, -1))
 				tp.mu.Unlock()
 				return t
 			}
@@ -128,15 +126,15 @@ type subprocess struct {
 	// syscallThreads are reserved for syscalls (except clone, which is
 	// handled in the dedicated goroutine corresponding to requests above).
 	syscallThreads threadPool
-	syscallRPCChan chan syscallRPC
 
 	// mu protects the following fields.
 	mu sync.Mutex
 
 	// contexts is the set of contexts for which it's possible that
 	// context.lastFaultSP == this subprocess.
-	sysemuRPCPool map[int64]chan sysemuRPC
-	contexts      map[*context]struct{}
+	syscallRPCChan chan syscallRPC
+	sysemuRPCPool  map[int64]chan sysemuRPC
+	contexts       map[*context]struct{}
 }
 
 // newSubprocess returns a usable subprocess.
@@ -220,11 +218,11 @@ func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
 		syscallThreads: threadPool{
 			threads: make(map[int32]*thread),
 		},
-		syscallRPCChan: make(chan syscallRPC),
 		sysemuRPCPool:  make(map[int64]chan sysemuRPC),
+		syscallRPCChan: make(chan syscallRPC),
 		contexts:       make(map[*context]struct{}),
 	}
-	go sp.syscallLoop()
+	go sp.syscallLoop(sp.syscallRPCChan)
 
 	sp.unmap()
 	return sp, nil
@@ -403,10 +401,10 @@ func (t *thread) wait(outcome waitOutcome) syscall.Signal {
 			}
 			if stopSig == syscall.SIGTRAP {
 				if status.TrapCause() == syscall.PTRACE_EVENT_EXIT {
-					return syscall.SIGTRAP
+					// Re-encode the trap cause the way it's expected.
+					return stopSig | syscall.Signal(status.TrapCause()<<8)
 				}
-				// Re-encode the trap cause the way it's expected.
-				return stopSig | syscall.Signal(status.TrapCause()<<8)
+				t.dumpAndPanic(fmt.Sprintf("unexpected cause: %v", status.TrapCause()))
 			}
 			// Not a trap signal.
 			return stopSig
@@ -507,7 +505,7 @@ func (t *thread) syscallWithOutcome(regs *arch.Registers, outcome waitOutcome) (
 		}
 
 		sig := t.wait(outcome)
-		if sig == syscall.SIGTRAP {
+		if (sig & syscall.SIGTRAP) != 0 {
 			// Reached syscall-enter-stop.
 			break
 		} else {
@@ -690,6 +688,8 @@ func (s *subprocess) switchToAppLoop(sysemuRPCChan chan sysemuRPC) {
 	defer runtime.UnlockOSThread()
 
 	// Grab our thread from the pool.
+	// currentTID := int32(procid.Current())
+	// t := s.syscallThreads.lookupOrCreate(currentTID, s.newThread)
 	t := s.newThread()
 
 	for rpc := range sysemuRPCChan {
@@ -736,28 +736,30 @@ type syscallRPCRet struct {
 	err error
 }
 
-func (s *subprocess) syscallLoop() {
+func (s *subprocess) syscallLoop(ch chan syscallRPC) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	currentTID := int32(procid.Current())
 	t := s.syscallThreads.lookupOrCreate(currentTID, s.newThread)
-	for rpc := range s.syscallRPCChan {
+	for rpc := range ch {
 		val, err := t.syscallIgnoreInterrupt(&t.initRegs, rpc.sysno, rpc.args...)
 		rpc.ret <- syscallRPCRet{val, err}
 	}
+	t.exit()
 }
 
 // syscall executes the given system call without handling interruptions.
 func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintptr, error) {
-	retch := make(chan syscallRPCRet)
-	s.syscallRPCChan <- syscallRPC{
+	ret := make(chan syscallRPCRet)
+	defer close(ret)
+	rpc := syscallRPC{
 		sysno: sysno,
 		args:  args,
-		ret:   retch,
+		ret:   ret,
 	}
-	ret := <-retch
-	close(retch)
-	return ret.val, ret.err
+	s.syscallRPCChan <- rpc
+	r := <-ret
+	return r.val, r.err
 }
 
 // MapFile implements platform.AddressSpace.MapFile.
