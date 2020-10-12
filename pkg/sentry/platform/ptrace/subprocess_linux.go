@@ -18,11 +18,11 @@ package ptrace
 
 import (
 	"fmt"
+	"runtime"
 	"syscall"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
@@ -193,17 +193,8 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 	panic("unreachable")
 }
 
-// createStub creates a stub processes as a child of an existing subprocesses.
-//
-// Precondition: the runtime OS thread must be locked.
-func (s *subprocess) createStub() (*thread, error) {
-	// There's no need to lock the runtime thread here, as this can only be
-	// called from a context that is already locked.
-	currentTID := int32(procid.Current())
-	t := s.syscallThreads.lookupOrCreate(currentTID, s.newThread)
-
+func (s *subprocess) createStubLocked(t *thread, regs arch.Registers) (*thread, error) {
 	// Pass the expected PPID to the child via R15.
-	regs := t.initRegs
 	initChildProcessPPID(&regs, t.tgid)
 
 	// Call fork in a subprocess.
@@ -236,7 +227,7 @@ func (s *subprocess) createStub() (*thread, error) {
 	// status. If the wait succeeds, we'll assume that it was the SIGSTOP.
 	// If the child actually exited, the attach below will fail.
 	_, err = t.syscallIgnoreInterrupt(
-		&t.initRegs,
+		&regs,
 		syscall.SYS_WAIT4,
 		arch.SyscallArgument{Value: uintptr(pid)},
 		arch.SyscallArgument{Value: 0},
@@ -253,7 +244,39 @@ func (s *subprocess) createStub() (*thread, error) {
 		tid:  int32(pid),
 		cpu:  ^uint32(0),
 	}
-	childT.attach()
+	return childT, nil
+}
 
+func (s *subprocess) createStubLoop(ch chan createStubRPC) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	t := s.newThread()
+	regs := t.initRegs
+	for rpc := range ch {
+		childT, err := s.createStubLocked(t, regs)
+		rpc.ret <- createStubRPCRet{
+			child: childT,
+			err:   err,
+		}
+	}
+	t.exit()
+}
+
+// createStub creates a stub processes as a child of an existing subprocesses.
+//
+// Precondition: the runtime OS thread must be locked.
+func (s *subprocess) createStub() (*thread, error) {
+	ret := make(chan createStubRPCRet)
+	defer close(ret)
+	rpc := createStubRPC{
+		ret: ret,
+	}
+	s.createStubRPCChan <- rpc
+	retvalue := <-ret
+	childT, err := retvalue.child, retvalue.err
+	if err != nil {
+		return nil, err
+	}
+	childT.attach()
 	return childT, nil
 }

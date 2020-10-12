@@ -22,7 +22,6 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -67,50 +66,13 @@ type thread struct {
 	initRegs arch.Registers
 }
 
-// threadPool is a collection of threads.
-type threadPool struct {
-	// mu protects below.
-	mu sync.Mutex
-
-	// threads is the collection of threads.
-	//
-	// This map is indexed by system TID (the calling thread); which will
-	// be the tracer for the given *thread, and therefore capable of using
-	// relevant ptrace calls.
-	threads map[int32]*thread
+type createStubRPCRet struct {
+	child *thread
+	err   error
 }
 
-// lookupOrCreate looks up a given thread or creates one.
-//
-// newThread will generally be subprocess.newThread.
-//
-// Precondition: the runtime OS thread must be locked.
-func (tp *threadPool) lookupOrCreate(currentTID int32, newThread func() *thread) *thread {
-	tp.mu.Lock()
-	t, ok := tp.threads[currentTID]
-	if !ok {
-		// Before creating a new thread, see if we can find a thread
-		// whose system tid has disappeared.
-		//
-		// TODO(b/77216482): Other parts of this package depend on
-		// threads never exiting.
-		for origTID, t := range tp.threads {
-			// Signal zero is an easy existence check.
-			if err := syscall.Tgkill(syscall.Getpid(), int(origTID), 0); err != nil {
-				// This thread has been abandoned; reuse it.
-				delete(tp.threads, origTID)
-				tp.threads[currentTID] = t
-				tp.mu.Unlock()
-				return t
-			}
-		}
-
-		// Create a new thread.
-		t = newThread()
-		tp.threads[currentTID] = t
-	}
-	tp.mu.Unlock()
-	return t
+type createStubRPC struct {
+	ret chan createStubRPCRet
 }
 
 // subprocess is a collection of threads being traced.
@@ -120,21 +82,18 @@ type subprocess struct {
 	// requests is used to signal creation of new threads.
 	requests chan chan *thread
 
-	// sysemuThreads are reserved for emulation.
-	sysemuThreads threadPool
+	createStubRPCChan chan createStubRPC
 
-	// syscallThreads are reserved for syscalls (except clone, which is
-	// handled in the dedicated goroutine corresponding to requests above).
-	syscallThreads threadPool
+	syscallRPCChan chan syscallRPC
 
 	// mu protects the following fields.
 	mu sync.Mutex
 
+	sysemuRPCPool map[int64]chan sysemuRPC
+
 	// contexts is the set of contexts for which it's possible that
 	// context.lastFaultSP == this subprocess.
-	syscallRPCChan chan syscallRPC
-	sysemuRPCPool  map[int64]chan sysemuRPC
-	contexts       map[*context]struct{}
+	contexts map[*context]struct{}
 }
 
 // newSubprocess returns a usable subprocess.
@@ -211,18 +170,14 @@ func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
 
 	// Ready.
 	sp := &subprocess{
-		requests: requests,
-		sysemuThreads: threadPool{
-			threads: make(map[int32]*thread),
-		},
-		syscallThreads: threadPool{
-			threads: make(map[int32]*thread),
-		},
-		sysemuRPCPool:  make(map[int64]chan sysemuRPC),
-		syscallRPCChan: make(chan syscallRPC),
-		contexts:       make(map[*context]struct{}),
+		requests:          requests,
+		sysemuRPCPool:     make(map[int64]chan sysemuRPC),
+		syscallRPCChan:    make(chan syscallRPC),
+		createStubRPCChan: make(chan createStubRPC),
+		contexts:          make(map[*context]struct{}),
 	}
 	go sp.syscallLoop(sp.syscallRPCChan)
+	go sp.createStubLoop(sp.createStubRPCChan)
 
 	sp.unmap()
 	return sp, nil
@@ -687,9 +642,7 @@ func (s *subprocess) switchToAppLoop(sysemuRPCChan chan sysemuRPC) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	// Grab our thread from the pool.
-	// currentTID := int32(procid.Current())
-	// t := s.syscallThreads.lookupOrCreate(currentTID, s.newThread)
+	// Grab our new thread
 	t := s.newThread()
 
 	for rpc := range sysemuRPCChan {
@@ -697,7 +650,6 @@ func (s *subprocess) switchToAppLoop(sysemuRPCChan chan sysemuRPC) {
 		rpc.ret <- isSyscall
 	}
 
-	// syscall.Kill(int(t.tid), syscall.Signal(syscall.SIGCONT))
 	t.exit()
 }
 
@@ -718,7 +670,7 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 		ch = make(chan sysemuRPC)
 		s.sysemuRPCPool[c.cid] = ch
 		go s.switchToAppLoop(ch)
-		go func() { <-c.done; close(ch) }()
+		go func() { <-c.done; close(ch); delete(s.sysemuRPCPool, c.cid) }()
 	}
 	s.mu.Unlock()
 	ch <- rpc
@@ -739,8 +691,8 @@ type syscallRPCRet struct {
 func (s *subprocess) syscallLoop(ch chan syscallRPC) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	currentTID := int32(procid.Current())
-	t := s.syscallThreads.lookupOrCreate(currentTID, s.newThread)
+
+	t := s.newThread()
 	for rpc := range ch {
 		val, err := t.syscallIgnoreInterrupt(&t.initRegs, rpc.sysno, rpc.args...)
 		rpc.ret <- syscallRPCRet{val, err}
